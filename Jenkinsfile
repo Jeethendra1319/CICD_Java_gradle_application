@@ -49,7 +49,6 @@ pipeline {
                     steps {
                         script {
                             try {
-                                // Check if health-check.sh exists before executing it
                                 sh '''
                                     if [ -f health-check.sh ]; then
                                         chmod +x health-check.sh
@@ -121,7 +120,7 @@ pipeline {
             steps {
                 script {
                     try {
-                        withCredentials([usernamePassword(credentialsId: 'aws-login-creds', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                        withCredentials([usernamePassword(credentialsId: 'aws-login-cred', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
                             sh """
                                 aws ecr get-login-password --region ${env.aws_region} | docker login --username AWS --password-stdin ${env.aws_account_id}.dkr.ecr.${env.aws_region}.amazonaws.com
                                 docker tag spring-app:${env.Docker_tag} ${env.aws_account_id}.dkr.ecr.${env.aws_region}.amazonaws.com/spring-app:${env.Docker_tag}
@@ -136,11 +135,110 @@ pipeline {
                 }
             }
         }
+
+        stage('Prepare Helm Charts') {
+            steps {
+                script {
+                    docker.image('alpine:3.18').inside('--user root') {
+                        withCredentials([usernamePassword(credentialsId: 'aws-login-cred', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                            sh '''
+                                apk add --no-cache bash curl git tar gzip python3 py3-pip
+                                pip install --no-cache-dir awscli
+                                curl -fsSL https://get.helm.sh/helm-v3.14.0-linux-amd64.tar.gz -o helm.tar.gz
+                                tar -xzvf helm.tar.gz -C /tmp
+                                mv /tmp/linux-amd64/helm /usr/local/bin/helm
+
+                                sed -i "s:IMAGE_NAME:${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/spring-app:" kubernetes/myapp/values.yaml
+                                sed -i "s:IMAGE_TAG:${Docker_tag}:" kubernetes/myapp/values.yaml
+                                helm package kubernetes/myapp/
+
+                                helmversion=$(helm show chart kubernetes/myapp/ | grep version | cut -d: -f 2 | tr -d ' ')
+                                aws s3 cp myapp-${helmversion}.tgz s3://helm-chart-testing/helm-charts/spring-app-${helmversion}.tgz
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to EKS Cluster') {
+            steps {
+                script {
+                    docker.image('707077521494.dkr.ecr.us-east-1.amazonaws.com/spring-app:deploy').inside('--entrypoint="" --user root') {
+                        withCredentials([usernamePassword(credentialsId: 'aws-login-cred', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                            sh '''
+                                mkdir -p /root/.aws
+                                echo "[default]" > /root/.aws/config
+                                echo "region = us-east-1" >> /root/.aws/config
+                                export AWS_CONFIG_FILE="/root/.aws/config"
+                                aws eks update-kubeconfig --region ${aws_region} --name my-k8s-cluster
+                                helm upgrade --install myjavaapp kubernetes/myapp/
+                                helm list
+                                sleep 120
+                                kubectl get po
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Verify App Deployment') {
+            steps {
+                script {
+                    docker.image('707077521494.dkr.ecr.us-east-1.amazonaws.com/spring-app:deploy').inside('--entrypoint="" --user root') {
+                        withCredentials([usernamePassword(credentialsId: 'aws-login-cred', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                            sh '''
+                                mkdir -p /root/.aws
+                                echo "[default]" > /root/.aws/config
+                                echo "region = us-east-1" >> /root/.aws/config
+                                export AWS_CONFIG_FILE="/root/.aws/config"
+                                aws eks update-kubeconfig --region ${aws_region} --name my-k8s-cluster
+                                kubectl run curl --image=curlimages/curl -i --rm --restart=Never -- curl myjavaapp-spring-app:8080
+                            '''
+                        }
+                    }
+                }
+            }
+
+            post {
+                always {
+                    script {
+                        docker.image('707077521494.dkr.ecr.us-east-1.amazonaws.com/spring-app:deploy').inside('--entrypoint="" --user root') {
+                            withCredentials([usernamePassword(credentialsId: 'aws-login-cred', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                                sh '''
+                                    mkdir -p /root/.aws
+                                    echo "[default]" > /root/.aws/config
+                                    echo "region = us-east-1" >> /root/.aws/config
+                                    export AWS_CONFIG_FILE="/root/.aws/config"
+                                    aws eks update-kubeconfig --region ${aws_region} --name my-k8s-cluster
+                                    helm uninstall myjavaapp
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     post {
         always {
+            archiveArtifacts artifacts: 'build/reports/tests/test/**', followSymlinks: false
+            publishHTML([allowMissing: false, alwaysLinkToLastBuild: false, keepAll: false, reportDir: 'build/reports/tests/test/', reportFiles: 'index.html', reportName: 'test-case-report', reportTitles: 'test-case-report', useWrapperFileDirectly: true])
             cleanWs()
+        }
+
+        success {
+            echo "Build succeeded!"
+        }
+
+        failure {
+            echo "Build failed, investigate the errors above."
+        }
+
+        unstable {
+            echo "Build is unstable, please review the warnings and issues."
         }
     }
 }
